@@ -315,18 +315,48 @@ def transfer_put(port: serial.Serial, filename: str, data: bytes,
 # High-level capture operations
 # ---------------------------------------------------------------------------
 
+MEAS_TEMP_NAME = "SCPI_MEA"
+
+
 def dump_measurement(port: serial.Serial, use_ref: bool = False,
                      verbose: bool = False) -> bytes:
     """
-    Issue :MEMory:DUMP:MEASurement? and return the binary measurement file.
+    Return the current measurement as a complete binary file including settings.
 
-    If use_ref is True, the REFerence measurement is returned instead of NEW.
-    If the acquisition is still running when NEW is requested, the instrument
-    waits for it to complete before responding.
+    :MEMory:DUMP:MEASurement? omits the User Settings section (labels, clock
+    assignments).  To include settings we store to a temp file on diskette with
+    :MMEMory:STORe:MEASurement (which saves ALL sections), transfer it back,
+    then delete it.  If the diskette operation fails we fall back to the direct
+    DUMP command (no labels).
+
+    If use_ref is True, REFerence data is requested instead of NEW.
     """
-    param = " REFerence" if use_ref else ""
-    send_command(port, f":MEMory:DUMP:MEASurement?{param}", verbose=verbose)
-    return read_blocks(port, verbose=verbose)
+    tmp = MEAS_TEMP_NAME
+    try:
+        if verbose:
+            print(f"  Storing measurement to diskette as '{tmp}' ...")
+        send_command(port, f':MMEMory:STORe:MEASurement "{tmp}"', verbose=verbose)
+        time.sleep(1.5)
+
+        try:
+            send_command(port, f':MMEMory:TRANsfer? "{tmp}"', verbose=verbose)
+            return read_blocks(port, verbose=verbose)
+        finally:
+            try:
+                send_command(port, f':MMEMory:DELete "{tmp}"', verbose=verbose)
+                time.sleep(0.5)
+            except Exception as e:
+                import sys as _sys
+                print(f"Warning: could not delete '{tmp}' from diskette: {e}",
+                      file=_sys.stderr)
+
+    except Exception as e:
+        import sys as _sys
+        print(f"Warning: diskette store failed ({e}), falling back to direct dump "
+              f"(settings/labels will not be included)", file=_sys.stderr)
+        send_command(port, f":MEMory:DUMP:MEASurement?{' REFerence' if use_ref else ''}",
+                     verbose=verbose)
+        return read_blocks(port, verbose=verbose)
 
 
 def capture_screen(port: serial.Serial, verbose: bool = False) -> bytes:
