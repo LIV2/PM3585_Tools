@@ -596,28 +596,37 @@ class PM3585Reader:
         return settings
 
     def read(self):
-        """Read the complete file"""
-        with open(self.filepath, 'rb') as f:
+        """Read the complete file.
+
+        self.filepath may be a path string/Path, or any readable binary
+        file-like object (e.g. io.BytesIO for in-memory data).
+        """
+        import io as _io
+        import contextlib as _cl
+        if isinstance(self.filepath, (str, Path)):
+            ctx = open(self.filepath, 'rb')
+        elif isinstance(self.filepath, (bytes, bytearray)):
+            ctx = _cl.nullcontext(_io.BytesIO(self.filepath))
+        else:
+            ctx = _cl.nullcontext(self.filepath)
+
+        with ctx as f:
             self.file = f
             self.header = self.read_header()
 
-            # Read NEW measurement if present
             if self.header.offset_new != 0:
                 f.seek(self.header.offset_new)
                 self.new_measurement = self.read_measurement()
 
-            # Read REF measurement if present
             if self.header.offset_ref != 0:
                 f.seek(self.header.offset_ref)
                 self.ref_measurement = self.read_measurement()
 
-            # Read settings if present
             if self.header.offset_settings != 0:
                 f.seek(self.header.offset_settings)
                 try:
                     self.settings = self.read_settings()
                 except Exception as e:
-                    # Settings parsing is complex, continue without labels if it fails
                     print(f"Warning: Could not parse settings (labels will use generic names): {e}")
                     self.settings = None
 
@@ -1210,7 +1219,8 @@ class CSVWriter:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Convert PM3585 logic analyzer files to VCD or CSV format",
+        description="Convert PM3585 logic analyzer files to VCD or CSV format, "
+                    "or capture and convert directly from the instrument via RS-232.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1219,10 +1229,17 @@ Examples:
   %(prog)s measurement.mea --format csv       # Convert to CSV format
   %(prog)s measurement.mea --ref              # Convert REF measurement instead of NEW
   %(prog)s measurement.mea --info             # Show file information only
+  %(prog)s --port /dev/ttyUSB0 -o out.vcd              # Capture and convert via RS-232
+  %(prog)s --port /dev/ttyUSB0 --trigger -o out.vcd    # Trigger, capture, convert
         """
     )
 
-    parser.add_argument("input", help="Input PM3585 measurement file")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("input", nargs="?", help="Input PM3585 measurement file")
+    source.add_argument("--port", metavar="PORT",
+                        help="Capture measurement directly from the instrument "
+                             "via RS-232 (e.g. /dev/ttyUSB0 or COM3)")
+
     parser.add_argument("-o", "--output", help="Output file (default: input.vcd or input.csv)")
     parser.add_argument("-f", "--format", choices=["vcd", "csv"], default="vcd",
                         help="Output format: vcd (sigrok/PulseView), csv (generic)")
@@ -1234,23 +1251,88 @@ Examples:
                         help="Group multi-bit labels into VCD buses (experimental, may not work in PulseView)")
     parser.add_argument("--info", action="store_true",
                         help="Show file information and exit")
+    parser.add_argument("--baud", type=int, default=19200,
+                        choices=[75, 150, 300, 1200, 2400, 4800, 9600, 19200],
+                        help="Baud rate for RS-232 (default: 19200, --port only)")
+    parser.add_argument("--no-handshake", action="store_true",
+                        help="Disable RTS/CTS handshaking (--port only)")
+    parser.add_argument("--trigger", action="store_true",
+                        help="Send :INITiate to start a new acquisition and wait "
+                             "for completion before capturing (--port only)")
+    parser.add_argument("--stop", action="store_true",
+                        help="Send :STOP (manual trigger) before capturing "
+                             "(--port only)")
+    parser.add_argument("--timeout", type=float, default=120, metavar="SECS",
+                        help="Acquisition wait timeout in seconds "
+                             "(default: 120, --trigger only)")
     parser.add_argument("-v", "--verbose", action="store_true",
                         help="Verbose output")
 
     args = parser.parse_args()
 
-    # Read input file
-    try:
-        reader = PM3585Reader(args.input).read()
-    except FileNotFoundError:
-        print(f"Error: File not found: {args.input}", file=sys.stderr)
-        sys.exit(1)
-    except ValueError as e:
-        print(f"Error: {e}", file=sys.stderr)
-        sys.exit(1)
+    # Read measurement data — from file or live via RS-232
+    if args.port:
+        import pm3585_serial as la
+        rtscts = not args.no_handshake
+        print(f"Connecting to {args.port} at {args.baud} baud "
+              f"({'RTS/CTS' if rtscts else 'no handshake'}) ...")
+        try:
+            port = la.open_port(args.port, baud=args.baud, rtscts=rtscts)
+        except Exception as e:
+            print(f"Error opening serial port: {e}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            idn = la.identify(port, verbose=args.verbose)
+            if idn:
+                print(f"Instrument: {idn}")
+
+            if args.trigger or args.stop:
+                import time
+
+            if args.trigger:
+                print("Starting acquisition (:INITiate) ...")
+                la.send_command(port, ":INITiate", verbose=args.verbose)
+                time.sleep(0.2)
+
+            if args.stop:
+                print("Sending :STOP ...")
+                la.send_command(port, ":STOP", verbose=args.verbose)
+                time.sleep(0.2)
+
+            if args.trigger:
+                print(f"Waiting for acquisition to complete "
+                      f"(timeout {args.timeout:.0f}s) ...")
+                if not la.wait_for_idle(port, timeout=args.timeout,
+                                        verbose=args.verbose):
+                    print("Error: acquisition did not complete within timeout",
+                          file=sys.stderr)
+                    sys.exit(1)
+                print("Acquisition complete.")
+
+            meas_name = "REFerence" if args.ref else "NEW"
+            print(f"Dumping {meas_name} measurement ...")
+            raw = la.dump_measurement(port, use_ref=args.ref, verbose=args.verbose)
+        finally:
+            port.close()
+        source_label = args.port
+        try:
+            reader = PM3585Reader(raw).read()
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+    else:
+        source_label = args.input
+        try:
+            reader = PM3585Reader(args.input).read()
+        except FileNotFoundError:
+            print(f"Error: File not found: {args.input}", file=sys.stderr)
+            sys.exit(1)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
 
     # Show file info
-    print(f"File: {args.input}")
+    print(f"Source: {source_label}")
     print(f"  Version: {reader.header.version}")
     print(f"  Frequency: {reader.header.frequency_mhz} MHz")
     print(f"  Pods: {reader.header.num_pods}")
@@ -1303,9 +1385,12 @@ Examples:
     # Determine output file
     if args.output:
         output_path = args.output
-    else:
+    elif args.input:
         suffixes = {'vcd': '.vcd', 'csv': '.csv'}
         output_path = Path(args.input).with_suffix(suffixes[args.format])
+    else:
+        suffixes = {'vcd': '.vcd', 'csv': '.csv'}
+        output_path = Path("capture" + suffixes[args.format])
 
     # Write output file
     try:

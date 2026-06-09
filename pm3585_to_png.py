@@ -13,17 +13,40 @@ SUPPORTED_BPP = 2
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Convert a PM3585 hardcopy file to PNG format."
+        description="Convert a PM3585 hardcopy file to PNG format, or capture "
+                    "directly from the instrument via RS-232."
     )
-    parser.add_argument(
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument(
         "infile",
+        nargs="?",
         help="Input PM3585 hardcopy file to convert."
     )
+    source.add_argument(
+        "--port",
+        metavar="PORT",
+        help="Capture screen directly from the instrument via RS-232 "
+             "(e.g. /dev/ttyUSB0 or COM3)."
+    )
     parser.add_argument(
-        "outfile",
-        nargs="?",
+        "-o", "--output",
+        metavar="FILE",
         default=None,
-        help="Optional output PNG filename. Defaults to infile + .png."
+        help="Output PNG filename. Defaults to infile + .png, or screen.png "
+             "when using --port."
+    )
+    parser.add_argument(
+        "--baud", type=int, default=19200,
+        choices=[75, 150, 300, 1200, 2400, 4800, 9600, 19200],
+        help="Baud rate for RS-232 (default: 19200, --port only)"
+    )
+    parser.add_argument(
+        "--no-handshake", action="store_true",
+        help="Disable RTS/CTS handshaking (--port only)"
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Verbose output (--port only)"
     )
     return parser.parse_args()
 
@@ -99,16 +122,31 @@ def decode_image(raw_bytes, pixels_per_line, scan_lines, bpp):
 
 def main():
     args = parse_args()
-    infile = args.infile
-    outfile = args.outfile or infile + ".png"
-
-    if not os.path.isfile(infile):
-        print(f"Error: input file not found: {infile}", file=sys.stderr)
-        sys.exit(1)
 
     try:
-        with open(infile, "rb") as fh:
-            file_data = fh.read()
+        if args.port:
+            import pm3585_serial as la
+            rtscts = not args.no_handshake
+            print(f"Connecting to {args.port} at {args.baud} baud "
+                  f"({'RTS/CTS' if rtscts else 'no handshake'}) ...")
+            port = la.open_port(args.port, baud=args.baud, rtscts=rtscts)
+            try:
+                idn = la.identify(port, verbose=args.verbose)
+                if idn:
+                    print(f"Instrument: {idn}")
+                print("Capturing screen ...")
+                file_data = la.capture_screen(port, verbose=args.verbose)
+            finally:
+                port.close()
+            outfile = args.output or "screen.png"
+        else:
+            infile = args.infile
+            if not os.path.isfile(infile):
+                print(f"Error: input file not found: {infile}", file=sys.stderr)
+                sys.exit(1)
+            with open(infile, "rb") as fh:
+                file_data = fh.read()
+            outfile = args.output or infile + ".png"
 
         pixels_per_line, scan_lines, bpp, image_size = parse_header(file_data)
 
@@ -125,7 +163,7 @@ def main():
         png.save(outfile, "PNG")
         print(f"Saved: {outfile}")
     except Exception as exc:
-        print(f"Error: failed to convert {infile}: {exc}", file=sys.stderr)
+        print(f"Error: {exc}", file=sys.stderr)
         sys.exit(1)
 
 
